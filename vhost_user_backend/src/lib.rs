@@ -22,7 +22,7 @@ use vhost_rs::vhost_user::{
 };
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
-use vm_virtio::{DescriptorChain, Queue};
+use vm_virtio::Queue;
 use vmm_sys_util::eventfd::EventFd;
 
 #[derive(Debug)]
@@ -63,6 +63,9 @@ pub trait VhostUserBackend: Send + Sync + 'static {
     /// Virtio features.
     fn features(&self) -> u64;
 
+    /// Update guest memory regions.
+    fn update_memory(&mut self, mem: GuestMemoryMmap) -> result::Result<(), io::Error>;
+
     /// This function gets called if the backend registered some additional
     /// listeners onto specific file descriptors. The library can handle
     /// virtqueues on its own, but does not know what to do with events
@@ -71,28 +74,20 @@ pub trait VhostUserBackend: Send + Sync + 'static {
         &mut self,
         device_event: u16,
         evset: epoll::Events,
+        vrings: &mut Vec<Arc<RwLock<Vring>>>,
     ) -> result::Result<bool, io::Error>;
-
-    /// This function is responsible for the actual processing that needs to
-    /// happen when one of the virtqueues is available.
-    fn process_queue(
-        &mut self,
-        q_idx: u16,
-        avail_desc: &DescriptorChain,
-        mem: &GuestMemoryMmap,
-    ) -> result::Result<u32, io::Error>;
 
     /// Get virtio device configuration.
     /// A default implementation is provided as we cannot expect all backends
     /// to implement this function.
-    fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
+    fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
         Vec::new()
     }
 
     /// Set virtio device configuration.
     /// A default implementation is provided as we cannot expect all backends
     /// to implement this function.
-    fn set_config(&mut self, offset: u32, buf: &[u8]) -> result::Result<(), io::Error> {
+    fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> result::Result<(), io::Error> {
         Ok(())
     }
 }
@@ -132,7 +127,7 @@ impl<S: VhostUserBackend> VhostUserDaemon<S> {
     /// disconnects.
     pub fn start(&mut self) -> Result<()> {
         let mut slave_listener =
-            SlaveListener::new(self.sock_path.as_str(), false, self.handler.clone())
+            SlaveListener::new(self.sock_path.as_str(), true, self.handler.clone())
                 .map_err(Error::CreateSlaveListener)?;
         let mut slave_handler = slave_listener
             .accept()
@@ -179,7 +174,7 @@ struct Memory {
     mappings: Vec<AddrMapping>,
 }
 
-struct Vring {
+pub struct Vring {
     queue: Queue,
     kick: Option<EventFd>,
     call: Option<EventFd>,
@@ -196,6 +191,18 @@ impl Vring {
             err: None,
             enabled: false,
         }
+    }
+
+    pub fn mut_queue(&mut self) -> &mut Queue {
+        &mut self.queue
+    }
+
+    pub fn signal_used_queue(&self) -> result::Result<(), io::Error> {
+        if let Some(kick) = self.kick.as_ref() {
+            return kick.write(1);
+        }
+
+        Ok(())
     }
 }
 
@@ -249,86 +256,34 @@ type VringEpollHandlerResult<T> = std::result::Result<T, VringEpollHandlerError>
 pub struct VringEpollHandler<S: VhostUserBackend> {
     backend: Arc<RwLock<S>>,
     vrings: Vec<Arc<RwLock<Vring>>>,
-    mem: Option<GuestMemoryMmap>,
     epoll_fd: RawFd,
 }
 
 impl<S: VhostUserBackend> VringEpollHandler<S> {
-    fn update_memory(&mut self, mem: Option<GuestMemoryMmap>) {
-        self.mem = mem;
-    }
-
-    /// Trigger the processing of a virtqueue. This function is meant to be
-    /// used by the caller whenever it might need some available queues to
-    /// send data back to the guest.
-    /// A concrete example is a backend registering one extra listener for
-    /// data that needs to be sent to the guest. When the associated event
-    /// is triggered, the backend will be invoked through its `handle_event`
-    /// implementation. And in this case, the way to handle the event is to
-    /// call into `process_queue` to let it invoke the backend implementation
-    /// of `process_queue`. With this twisted trick, all common parts related
-    /// to the virtqueues can remain part of the library.
-    pub fn process_queue(&mut self, q_idx: u16) -> VringEpollHandlerResult<()> {
-        let vring = &mut self.vrings[q_idx as usize].write().unwrap();
-        let mut used_desc_heads = vec![(0, 0); vring.queue.size as usize];
-        let mut used_count = 0;
-        if let Some(mem) = &self.mem {
-            for avail_desc in vring.queue.iter(&mem) {
-                let used_len = self
-                    .backend
-                    .write()
-                    .unwrap()
-                    .process_queue(q_idx, &avail_desc, &mem)
-                    .map_err(VringEpollHandlerError::ProcessQueueBackendProcessing)?;
-
-                used_desc_heads[used_count] = (avail_desc.index, used_len);
-                used_count += 1;
-            }
-
-            for &(desc_index, len) in &used_desc_heads[..used_count] {
-                vring.queue.add_used(&mem, desc_index, len);
-            }
-        }
-
-        if used_count > 0 {
-            if let Some(call) = &vring.call {
-                call.write(1)
-                    .map_err(VringEpollHandlerError::SignalUsedQueue)?;
-            }
-        }
-
-        Ok(())
-    }
-
     fn handle_event(
         &mut self,
         device_event: u16,
         evset: epoll::Events,
     ) -> VringEpollHandlerResult<bool> {
         let num_queues = self.vrings.len();
-        match device_event as usize {
-            x if x < num_queues => {
-                if let Some(kick) = &self.vrings[device_event as usize].read().unwrap().kick {
-                    kick.read()
-                        .map_err(VringEpollHandlerError::HandleEventReadKick)?;
-                }
-
-                // If the vring is not enabled, it should not be processed.
-                // The event is only read to be discarded.
-                if !self.vrings[device_event as usize].read().unwrap().enabled {
-                    return Ok(false);
-                }
-
-                self.process_queue(device_event)?;
-                Ok(false)
+        if (device_event as usize) < num_queues {
+            if let Some(kick) = &self.vrings[device_event as usize].read().unwrap().kick {
+                kick.read()
+                    .map_err(VringEpollHandlerError::HandleEventReadKick)?;
             }
-            _ => self
-                .backend
-                .write()
-                .unwrap()
-                .handle_event(device_event, evset)
-                .map_err(VringEpollHandlerError::HandleEventBackendHandling),
+
+            // If the vring is not enabled, it should not be processed.
+            // The event is only read to be discarded.
+            if !self.vrings[device_event as usize].read().unwrap().enabled {
+                return Ok(false);
+            }
         }
+
+        self.backend
+            .write()
+            .unwrap()
+            .handle_event(device_event, evset, &mut self.vrings)
+            .map_err(VringEpollHandlerError::HandleEventBackendHandling)
     }
 
     fn register_vring_listener(&self, q_idx: usize) -> VringEpollHandlerResult<()> {
@@ -392,8 +347,6 @@ impl<S: VhostUserBackend> VringEpollHandler<S> {
 enum VringWorkerError {
     /// Failed while waiting for events.
     EpollWait(io::Error),
-    /// Failed to handle event.
-    HandleEvent(VringEpollHandlerError),
 }
 
 /// Result of vring worker operations.
@@ -505,7 +458,6 @@ impl<S: VhostUserBackend> VhostUserHandler<S> {
         let vring_handler = Arc::new(RwLock::new(VringEpollHandler {
             backend: backend.clone(),
             vrings: vrings.clone(),
-            mem: None,
             epoll_fd,
         }));
         let worker = VringWorker {
@@ -634,7 +586,13 @@ impl<S: VhostUserBackend> VhostUserSlaveReqHandler for VhostUserHandler<S> {
         let mem = GuestMemoryMmap::with_files(regions).map_err(|e| {
             VhostUserError::ReqHandlerError(io::Error::new(io::ErrorKind::Other, e))
         })?;
-        self.vring_handler.write().unwrap().update_memory(Some(mem));
+        self.backend
+            .write()
+            .unwrap()
+            .update_memory(mem)
+            .map_err(|e| {
+                VhostUserError::ReqHandlerError(io::Error::new(io::ErrorKind::Other, e))
+            })?;
         self.memory = Some(Memory { mappings });
 
         Ok(())
