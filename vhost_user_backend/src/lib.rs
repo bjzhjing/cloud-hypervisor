@@ -340,6 +340,10 @@ impl<S: VhostUserBackend> VringEpollHandler<S> {
             epoll::Event::new(ev_type, data),
         )
     }
+
+    pub fn get_epoll_fd(&self) -> RawFd {
+        self.epoll_fd
+    }
 }
 
 #[derive(Debug)]

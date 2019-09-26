@@ -25,7 +25,7 @@ use std::io::Read;
 use std::io::{self, Write};
 use std::mem;
 use std::net::Ipv4Addr;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::process;
 use std::sync::{Arc, RwLock};
 use std::vec::Vec;
@@ -77,10 +77,6 @@ pub enum Error {
     FailedReadTap,
     /// Failed to signal used queue.
     FailedSignalingUsedQueue,
-    /// Failed to handle event other than input event.
-    HandleEventNotEpollIn,
-    /// Failed to handle unknown event.
-    HandleEventUnknownEvent,
     /// Invalid vring address.
     InvalidVringAddr,
     /// No vring call fd to notify.
@@ -145,6 +141,7 @@ fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
 
+#[derive(Clone)]
 struct VhostUserNetBackend {
     mem: Option<GuestMemoryMmap>,
     vring_handler: Option<Arc<RwLock<VringEpollHandler<Self>>>>,
@@ -153,9 +150,7 @@ struct VhostUserNetBackend {
     rx: RxVirtio,
     tx: TxVirtio,
     rx_tap_listening: bool,
-    bytes_read: usize,
-    frame_buf_offset: usize,
-    frame_buf: [u8; MAX_BUFFER_SIZE],
+    epoll_fd: RawFd,
 }
 
 impl VhostUserNetBackend {
@@ -182,9 +177,7 @@ impl VhostUserNetBackend {
             rx,
             tx,
             rx_tap_listening: false,
-            bytes_read: 0,
-            frame_buf_offset: 0,
-            frame_buf: [0u8; MAX_BUFFER_SIZE],
+            epoll_fd: 0,
         })
     }
 
@@ -207,20 +200,9 @@ impl VhostUserNetBackend {
             let mut next_desc = vring.mut_queue().iter(&mem).next();
 
             if next_desc.is_none() {
-                println!("rx queue has no available descriptors!\n");
                 // Queue has no available descriptors
                 if self.rx_tap_listening {
-                    self.vring_handler
-                        .as_ref()
-                        .unwrap()
-                        .read()
-                        .unwrap()
-                        .unregister_listener(
-                            self.tap.as_raw_fd(),
-                            epoll::Events::EPOLLIN,
-                            u64::from(RX_TAP_EVENT),
-                        )
-                        .unwrap();
+                    self.unregister_tap_rx_listener().unwrap();
                     self.rx_tap_listening = false;
                 }
                 return false;
@@ -333,7 +315,6 @@ impl VhostUserNetBackend {
 
     fn process_tx(&mut self, vring: &mut Vring) -> Result<()> {
         if let Some(mem) = &self.mem {
-            println!("Entering process_tx!\n");
             let mut used_desc_heads = [(0, 0); QUEUE_SIZE];
             let mut used_count = 0;
             while let Some(avail_desc) = vring.mut_queue().iter(&mem).next() {
@@ -352,7 +333,6 @@ impl VhostUserNetBackend {
                     next_desc = desc.next_descriptor();
                 }
                 used_desc_heads[used_count] = (head_index, read_count);
-
                 used_count += 1;
                 read_count = 0;
                 // Copy buffer from across multiple descriptors.
@@ -388,13 +368,14 @@ impl VhostUserNetBackend {
                         println!("net: tx: error failed to write to tap: {}", e);
                     }
                 };
+            }
 
+            if used_count > 0 {
                 for &(desc_index, _) in &used_desc_heads[..used_count] {
                     vring.mut_queue().add_used(&mem, desc_index, 0);
                 }
+                vring.signal_used_queue().unwrap();
             }
-
-            vring.signal_used_queue().unwrap();
         } else {
             error!("No memory for vhost-user-net backend tx handling!\n");
             return Err(Error::NoMemoryForTx);
@@ -404,6 +385,26 @@ impl VhostUserNetBackend {
 
     fn read_tap(&mut self) -> io::Result<usize> {
         self.tap.read(&mut self.rx.frame_buf)
+    }
+
+    fn register_tap_rx_listener(&self) -> std::result::Result<(), std::io::Error> {
+        epoll::ctl(
+            self.epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            self.tap.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, u64::from(RX_TAP_EVENT)),
+        )?;
+        Ok(())
+    }
+
+    fn unregister_tap_rx_listener(&self) -> std::result::Result<(), std::io::Error> {
+        epoll::ctl(
+            self.epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_DEL,
+            self.tap.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, u64::from(RX_TAP_EVENT)),
+        )?;
+        Ok(())
     }
 }
 
@@ -442,35 +443,25 @@ impl VhostUserBackend for VhostUserNetBackend {
             println!("Invalid events operation!\n");
             return Ok(false);
         }
-
         match device_event {
             RX_QUEUE_EVENT => {
+                //println!("RX_QUEUE_EVENT received\n");
                 let mut vring = vrings[0].write().unwrap();
-                println!("RX_QUEUE_EVENT received");
                 self.resume_rx(&mut vring).unwrap();
-
                 if !self.rx_tap_listening {
-                    self.vring_handler
-                        .as_ref()
-                        .unwrap()
-                        .read()
-                        .unwrap()
-                        .register_listener(
-                            self.tap.as_raw_fd(),
-                            epoll::Events::EPOLLIN,
-                            u64::from(RX_TAP_EVENT),
-                        )?;
+                    self.register_tap_rx_listener()?;
                     self.rx_tap_listening = true;
                 }
             }
             TX_QUEUE_EVENT => {
+                //println!("TX_QUEUE_EVENT received!\n");
                 let mut vring = vrings[1].write().unwrap();
-                println!("TX_QUEUE_EVENT received!\n");
                 self.process_tx(&mut vring).unwrap();
             }
+
             RX_TAP_EVENT => {
+                //println!("RX_TAP_EVENT received");
                 let mut vring = vrings[0].write().unwrap();
-                println!("RX_TAP_EVENT received");
                 if self.rx.deferred_frame
                 // Process a deferred frame first if available. Don't read from tap again
                 // until we manage to receive this deferred frame.
@@ -487,17 +478,13 @@ impl VhostUserBackend for VhostUserNetBackend {
                 }
             }
             KILL_EVENT => {
-                self.kill_evt.read().unwrap();
                 println!("KILL_EVENT received, stopping epoll loop");
-                return Ok(true);
             }
             _ => {
-                println!("Unknown event for vhost-user-net");
-                return Err(io::Error::new(io::ErrorKind::Other, "unknown event"));
+                println!("Unknown event for vhost-user-net-backend");
             }
         }
-
-        Ok(false)
+        Ok(true)
     }
 }
 
@@ -585,22 +572,28 @@ fn main() {
 
     let vring_handler = Some(net_daemon.get_vring_handler());
     net_backend.write().unwrap().vring_handler = vring_handler.clone();
-    /*
-        if vring_handler
-            .as_ref()
-            .unwrap()
-            .read()
-            .unwrap()
-            .register_listener(
-                net_backend.read().unwrap().tap.as_raw_fd(),
-                epoll::Events::EPOLLIN,
-                u64::from(RX_TAP_EVENT),
-            )
-            .is_err()
-        {
-            println!("failed to register listener for rx tap event\n");
-        }
-    */
+    net_backend.write().unwrap().epoll_fd = vring_handler
+        .as_ref()
+        .unwrap()
+        .read()
+        .unwrap()
+        .get_epoll_fd();
+
+    if vring_handler
+        .as_ref()
+        .unwrap()
+        .read()
+        .unwrap()
+        .register_listener(
+            net_backend.read().unwrap().tap.as_raw_fd(),
+            epoll::Events::EPOLLIN,
+            u64::from(RX_TAP_EVENT),
+        )
+        .is_err()
+    {
+        println!("failed to register listener for rx tap event\n");
+    }
+    net_backend.write().unwrap().rx_tap_listening = true;
 
     if vring_handler
         .as_ref()
