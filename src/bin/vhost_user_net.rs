@@ -25,14 +25,14 @@ use std::io::Read;
 use std::io::{self, Write};
 use std::mem;
 use std::net::Ipv4Addr;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::process;
 use std::sync::{Arc, RwLock};
 use std::vec::Vec;
 
 use vhost_rs::vhost_user::message::*;
 use vhost_rs::vhost_user::Error as VhostUserError;
-use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring};
+use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringEpollHandler};
 
 use net_gen;
 
@@ -47,18 +47,15 @@ use vmm_sys_util::eventfd::EventFd;
 const MAX_BUFFER_SIZE: usize = 65562;
 const QUEUE_SIZE: usize = 256;
 const NUM_QUEUES: usize = 2;
-const QUEUE_SIZES: &[usize] = &[QUEUE_SIZE; NUM_QUEUES];
 
-// A frame is available for reading from the tap device to receive in the guest.
-const RX_TAP_EVENT: u16 = 2;
 // The guest has made a buffer available to receive a frame into.
 const RX_QUEUE_EVENT: u16 = 0;
 // The transmit queue has a frame that is ready to send from the guest.
 const TX_QUEUE_EVENT: u16 = 1;
+// A frame is available for reading from the tap device to receive in the guest.
+const RX_TAP_EVENT: u16 = 2;
 // The device has been dropped.
-pub const KILL_EVENT: u16 = 3;
-// Number of DeviceEventT events supported by this implementation.
-pub const NET_EVENTS_COUNT: u16 = 4;
+const KILL_EVENT: u16 = 3;
 
 pub type VhostUserResult<T> = std::result::Result<T, VhostUserError>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -80,6 +77,10 @@ pub enum Error {
     FailedReadTap,
     /// Failed to signal used queue.
     FailedSignalingUsedQueue,
+    /// Failed to handle event other than input event.
+    HandleEventNotEpollIn,
+    /// Failed to handle unknown event.
+    HandleEventUnknownEvent,
     /// Invalid vring address.
     InvalidVringAddr,
     /// No vring call fd to notify.
@@ -107,38 +108,33 @@ pub enum Error {
 }
 
 #[derive(Clone)]
-pub struct TxVirtio {
-    pub vring: Arc<RwLock<Vring>>,
+struct TxVirtio {
     iovec: Vec<(GuestAddress, usize)>,
     frame_buf: [u8; MAX_BUFFER_SIZE],
 }
 
 impl TxVirtio {
-    fn new(vring: Arc<RwLock<Vring>>) -> Self {
-        let tx_queue_max_size = vring.read().unwrap().queue.get_max_size() as usize;
+    fn new() -> Self {
         TxVirtio {
-            vring,
-            iovec: Vec::with_capacity(tx_queue_max_size),
+            iovec: Vec::new(),
             frame_buf: [0u8; MAX_BUFFER_SIZE],
         }
     }
 }
 
 #[derive(Clone)]
-pub struct RxVirtio {
+struct RxVirtio {
     deferred_frame: bool,
     deferred_irqs: bool,
-    pub vring: Arc<RwLock<Vring>>,
     bytes_read: usize,
     frame_buf: [u8; MAX_BUFFER_SIZE],
 }
 
 impl RxVirtio {
-    fn new(vring: Arc<RwLock<Vring>>) -> Self {
+    fn new() -> Self {
         RxVirtio {
             deferred_frame: false,
             deferred_irqs: false,
-            vring,
             bytes_read: 0,
             frame_buf: [0u8; MAX_BUFFER_SIZE],
         }
@@ -149,15 +145,17 @@ fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
 
-#[derive(Clone)]
-pub struct VhostUserNetBackend {
-    pub mem: Option<GuestMemoryMmap>,
-    pub kill_evt: EventFd,
-    pub tap: Tap,
-    pub rx: RxVirtio,
-    pub tx: TxVirtio,
-    pub rx_tap_listening: bool,
-    pub epoll_fd: RawFd,
+struct VhostUserNetBackend {
+    mem: Option<GuestMemoryMmap>,
+    vring_handler: Option<Arc<RwLock<VringEpollHandler<Self>>>>,
+    kill_evt: EventFd,
+    tap: Tap,
+    rx: RxVirtio,
+    tx: TxVirtio,
+    rx_tap_listening: bool,
+    bytes_read: usize,
+    frame_buf_offset: usize,
+    frame_buf: [u8; MAX_BUFFER_SIZE],
 }
 
 impl VhostUserNetBackend {
@@ -173,21 +171,20 @@ impl VhostUserNetBackend {
         tap.set_vnet_hdr_size(vnet_hdr_size)
             .map_err(Error::TapSetVnetHdrSize)?;
 
-        // Here is a temporary implementation to create Rx/Tx queue, multiple queue is not
-        // supported currently, so just simply add two queues here.
-        let vrings = vec![Arc::new(RwLock::new(Vring::new(QUEUE_SIZE as u16))); NUM_QUEUES];
-
-        let rx = RxVirtio::new(vrings[0].clone());
-        let tx = TxVirtio::new(vrings[1].clone());
+        let rx = RxVirtio::new();
+        let tx = TxVirtio::new();
 
         Ok(VhostUserNetBackend {
             mem: None,
+            vring_handler: None,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(|_| Error::CreateKillEventFd)?,
             tap,
             rx,
             tx,
             rx_tap_listening: false,
-            epoll_fd: 0,
+            bytes_read: 0,
+            frame_buf_offset: 0,
+            frame_buf: [0u8; MAX_BUFFER_SIZE],
         })
     }
 
@@ -202,25 +199,28 @@ impl VhostUserNetBackend {
         Self::new_with_tap(tap)
     }
 
-    fn signal_used_queue(&self, vring: &Vring) -> Result<()> {
-        if let Some(call) = &vring.call {
-            call.write(1).map_err(|_| Error::FailedSignalingUsedQueue)?;
-        }
-        Ok(())
-    }
-
     // Copies a single frame from `self.rx.frame_buf` into the guest. Returns true
     // if a buffer was used, and false if the frame must be deferred until a buffer
     // is made available by the driver.
-    fn rx_single_frame(&mut self) -> bool {
+    fn rx_single_frame(&mut self, vring: &mut Vring) -> bool {
         if let Some(mem) = &self.mem {
-            let mut next_desc = self.rx.vring.write().unwrap().queue.iter(&mem).next();
+            let mut next_desc = vring.mut_queue().iter(&mem).next();
 
             if next_desc.is_none() {
                 println!("rx queue has no available descriptors!\n");
                 // Queue has no available descriptors
                 if self.rx_tap_listening {
-                    self.unregister_tap_rx_listener().unwrap();
+                    self.vring_handler
+                        .as_ref()
+                        .unwrap()
+                        .read()
+                        .unwrap()
+                        .unregister_listener(
+                            self.tap.as_raw_fd(),
+                            epoll::Events::EPOLLIN,
+                            u64::from(RX_TAP_EVENT),
+                        )
+                        .unwrap();
                     self.rx_tap_listening = false;
                 }
                 return false;
@@ -263,11 +263,8 @@ impl VhostUserNetBackend {
                 }
             }
 
-            self.rx
-                .vring
-                .write()
-                .unwrap()
-                .queue
+            vring
+                .mut_queue()
                 .add_used(&mem, head_index, write_count as u32);
 
             // Mark that we have at least one pending packet and we need to interrupt the guest.
@@ -280,13 +277,13 @@ impl VhostUserNetBackend {
         }
     }
 
-    fn process_rx(&mut self) -> Result<()> {
+    fn process_rx(&mut self, vring: &mut Vring) -> Result<()> {
         // Read as many frames as possible.
         loop {
             match self.read_tap() {
                 Ok(count) => {
                     self.rx.bytes_read = count;
-                    if !self.rx_single_frame() {
+                    if !self.rx_single_frame(vring) {
                         println!("read_tap done, set rx_single_frame!\n");
                         self.rx.deferred_frame = true;
                         break;
@@ -308,22 +305,24 @@ impl VhostUserNetBackend {
         }
         if self.rx.deferred_irqs {
             self.rx.deferred_irqs = false;
-            self.signal_used_queue(&self.rx.vring.write().unwrap())
+            vring.signal_used_queue().unwrap();
+            Ok(())
         } else {
             Ok(())
         }
     }
 
-    fn resume_rx(&mut self) -> Result<()> {
+    fn resume_rx(&mut self, vring: &mut Vring) -> Result<()> {
         if self.rx.deferred_frame {
-            if self.rx_single_frame() {
+            if self.rx_single_frame(vring) {
                 self.rx.deferred_frame = false;
                 // process_rx() was interrupted possibly before consuming all
                 // packets in the tap; try continuing now.
-                self.process_rx()
+                self.process_rx(vring)
             } else if self.rx.deferred_irqs {
                 self.rx.deferred_irqs = false;
-                self.signal_used_queue(&self.rx.vring.write().unwrap())
+                vring.signal_used_queue().unwrap();
+                Ok(())
             } else {
                 Ok(())
             }
@@ -332,13 +331,12 @@ impl VhostUserNetBackend {
         }
     }
 
-    fn process_tx(&mut self) -> Result<()> {
+    fn process_tx(&mut self, vring: &mut Vring) -> Result<()> {
         if let Some(mem) = &self.mem {
-            println!("Entering process_tx for vhost-user-net!\n");
+            println!("Entering process_tx!\n");
             let mut used_desc_heads = [(0, 0); QUEUE_SIZE];
             let mut used_count = 0;
-            while let Some(avail_desc) = self.tx.vring.write().unwrap().queue.iter(&mem).next() {
-                println!("avail_desc is not none in process_tx for vhost-user-net!\n");
+            while let Some(avail_desc) = vring.mut_queue().iter(&mem).next() {
                 let head_index = avail_desc.index;
                 let mut read_count = 0;
                 let mut next_desc = Some(avail_desc);
@@ -354,6 +352,7 @@ impl VhostUserNetBackend {
                     next_desc = desc.next_descriptor();
                 }
                 used_desc_heads[used_count] = (head_index, read_count);
+
                 used_count += 1;
                 read_count = 0;
                 // Copy buffer from across multiple descriptors.
@@ -390,24 +389,12 @@ impl VhostUserNetBackend {
                     }
                 };
 
-                //self.tx
-                //    .vring
-                //    .write()
-                //    .unwrap()
-                //    .queue
-                //    .add_used(&mem, head_index, 0);
+                for &(desc_index, _) in &used_desc_heads[..used_count] {
+                    vring.mut_queue().add_used(&mem, desc_index, 0);
+                }
             }
 
-            for &(desc_index, _) in &used_desc_heads[..used_count] {
-                self.tx
-                    .vring
-                    .write()
-                    .unwrap()
-                    .queue
-                    .add_used(&mem, desc_index, 0);
-            }
-            self.signal_used_queue(&self.tx.vring.write().unwrap())
-                .unwrap();
+            vring.signal_used_queue().unwrap();
         } else {
             error!("No memory for vhost-user-net backend tx handling!\n");
             return Err(Error::NoMemoryForTx);
@@ -418,26 +405,6 @@ impl VhostUserNetBackend {
     fn read_tap(&mut self) -> io::Result<usize> {
         self.tap.read(&mut self.rx.frame_buf)
     }
-
-    fn register_tap_rx_listener(&self) -> std::result::Result<(), std::io::Error> {
-        epoll::ctl(
-            self.epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            self.tap.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, u64::from(RX_TAP_EVENT)),
-        )?;
-        Ok(())
-    }
-
-    fn unregister_tap_rx_listener(&self) -> std::result::Result<(), std::io::Error> {
-        epoll::ctl(
-            self.epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_DEL,
-            self.tap.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, u64::from(RX_TAP_EVENT)),
-        )?;
-        Ok(())
-    }
 }
 
 impl VhostUserBackend for VhostUserNetBackend {
@@ -445,8 +412,8 @@ impl VhostUserBackend for VhostUserNetBackend {
         NUM_QUEUES
     }
 
-    fn max_queue_size(&self) -> &[usize] {
-        QUEUE_SIZES
+    fn max_queue_size(&self) -> usize {
+        QUEUE_SIZE
     }
 
     fn features(&self) -> u64 {
@@ -457,77 +424,80 @@ impl VhostUserBackend for VhostUserNetBackend {
             | 1 << VIRTIO_NET_F_HOST_TSO4
             | 1 << VIRTIO_NET_F_HOST_UFO
             | 1 << VIRTIO_F_VERSION_1
-       //     | 1 << VIRTIO_RING_F_EVENT_IDX
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+    }
+
+    fn update_memory(&mut self, mem: GuestMemoryMmap) -> VhostUserBackendResult<()> {
+        self.mem = Some(mem);
+        Ok(())
     }
 
     fn handle_event(
         &mut self,
         device_event: u16,
         evset: epoll::Events,
+        vrings: &mut Vec<Arc<RwLock<Vring>>>,
     ) -> VhostUserBackendResult<bool> {
         if evset != epoll::Events::EPOLLIN {
             println!("Invalid events operation!\n");
             return Ok(false);
         }
+
         match device_event {
             RX_QUEUE_EVENT => {
+                let mut vring = vrings[0].write().unwrap();
                 println!("RX_QUEUE_EVENT received");
-                self.resume_rx().unwrap();
+                self.resume_rx(&mut vring).unwrap();
+
                 if !self.rx_tap_listening {
-                    self.register_tap_rx_listener()?;
+                    self.vring_handler
+                        .as_ref()
+                        .unwrap()
+                        .read()
+                        .unwrap()
+                        .register_listener(
+                            self.tap.as_raw_fd(),
+                            epoll::Events::EPOLLIN,
+                            u64::from(RX_TAP_EVENT),
+                        )?;
                     self.rx_tap_listening = true;
                 }
             }
             TX_QUEUE_EVENT => {
+                let mut vring = vrings[1].write().unwrap();
                 println!("TX_QUEUE_EVENT received!\n");
-                self.process_tx().unwrap();
+                self.process_tx(&mut vring).unwrap();
             }
             RX_TAP_EVENT => {
+                let mut vring = vrings[0].write().unwrap();
                 println!("RX_TAP_EVENT received");
                 if self.rx.deferred_frame
                 // Process a deferred frame first if available. Don't read from tap again
                 // until we manage to receive this deferred frame.
                 {
-                    if self.rx_single_frame() {
+                    if self.rx_single_frame(&mut vring) {
                         self.rx.deferred_frame = false;
-                        self.process_rx().unwrap();
+                        self.process_rx(&mut vring).unwrap();
                     } else if self.rx.deferred_irqs {
                         self.rx.deferred_irqs = false;
-                        self.signal_used_queue(&self.rx.vring.write().unwrap())
-                            .unwrap();
+                        vring.signal_used_queue().unwrap();
                     }
                 } else {
-                    self.process_rx().unwrap();
+                    self.process_rx(&mut vring).unwrap();
                 }
             }
             KILL_EVENT => {
+                self.kill_evt.read().unwrap();
                 println!("KILL_EVENT received, stopping epoll loop");
+                return Ok(true);
             }
             _ => {
-                println!("Unknown event for vhost-user-net-backend");
+                println!("Unknown event for vhost-user-net");
+                return Err(io::Error::new(io::ErrorKind::Other, "unknown event"));
             }
         }
-        Ok(true)
-    }
 
-    fn update_rx_vring(&mut self, vring: Arc<RwLock<Vring>>) {
-        self.rx.vring = vring;
-    }
-
-    fn update_tx_vring(&mut self, vring: Arc<RwLock<Vring>>) {
-        self.tx.vring = vring;
-    }
-
-    fn update_memory(&mut self, mem: Option<GuestMemoryMmap>) {
-        self.mem = mem;
-        if self.mem.is_some() {
-            println!("memory is not none after update!\n");
-        }
-    }
-
-    fn update_epollfd(&mut self, epoll_fd: RawFd) {
-        self.epoll_fd = epoll_fd;
+        Ok(false)
     }
 }
 
@@ -599,7 +569,9 @@ fn main() {
         }
     };
 
-    let net_backend = VhostUserNetBackend::new(backend_config.ip, backend_config.mask).unwrap();
+    let net_backend = Arc::new(RwLock::new(
+        VhostUserNetBackend::new(backend_config.ip, backend_config.mask).unwrap(),
+    ));
     println!("net_backend is created!\n");
 
     let name = "vhost-user-net-backend";
@@ -611,24 +583,38 @@ fn main() {
     .unwrap();
     println!("net_daemon is created!\n");
 
-    if let Err(e) = net_daemon.register_listener(
-        net_backend.tap.as_raw_fd(),
-        epoll::Events::EPOLLIN,
-        u64::from(RX_TAP_EVENT),
-    ) {
-        println!("failed to regsiter listener for tap with error: {:?}\n", e);
-        process::exit(1);
-    }
+    let vring_handler = Some(net_daemon.get_vring_handler());
+    net_backend.write().unwrap().vring_handler = vring_handler.clone();
+    /*
+        if vring_handler
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .register_listener(
+                net_backend.read().unwrap().tap.as_raw_fd(),
+                epoll::Events::EPOLLIN,
+                u64::from(RX_TAP_EVENT),
+            )
+            .is_err()
+        {
+            println!("failed to register listener for rx tap event\n");
+        }
+    */
 
-    if net_daemon
+    if vring_handler
+        .as_ref()
+        .unwrap()
+        .read()
+        .unwrap()
         .register_listener(
-            net_backend.kill_evt.as_raw_fd(),
+            net_backend.read().unwrap().kill_evt.as_raw_fd(),
             epoll::Events::EPOLLIN,
             u64::from(KILL_EVENT),
         )
         .is_err()
     {
-        println!("failed to regsiter listener for kill event\n");
+        println!("failed to register listener for kill event\n");
     }
 
     if let Err(e) = net_daemon.start() {
@@ -640,8 +626,4 @@ fn main() {
     }
 
     net_daemon.wait().unwrap();
-
-    loop {
-        std::thread::sleep(std::time::Duration::new(10, 0));
-    }
 }
