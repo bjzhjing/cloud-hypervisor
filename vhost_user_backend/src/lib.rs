@@ -198,8 +198,8 @@ impl Vring {
     }
 
     pub fn signal_used_queue(&self) -> result::Result<(), io::Error> {
-        if let Some(kick) = self.kick.as_ref() {
-            return kick.write(1);
+        if let Some(call) = &self.call {
+            return call.write(1);
         }
 
         Ok(())
