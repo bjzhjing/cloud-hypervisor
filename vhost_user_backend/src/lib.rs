@@ -451,7 +451,12 @@ impl<S: VhostUserBackend> VhostUserHandler<S> {
         let num_queues = backend.read().unwrap().num_queues();
         let max_queue_size = backend.read().unwrap().max_queue_size();
 
-        let vrings = vec![Arc::new(RwLock::new(Vring::new(max_queue_size as u16))); num_queues];
+        let mut vrings: Vec<Arc<RwLock<Vring>>> = Vec::new();
+        for _ in 0..num_queues {
+            let vring = Arc::new(RwLock::new(Vring::new(max_queue_size as u16)));
+            vrings.push(vring);
+        }
+
         // Create the epoll file descriptor
         let epoll_fd = epoll::create(true).map_err(VhostUserHandlerError::EpollCreateFd)?;
 
