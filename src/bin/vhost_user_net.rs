@@ -141,7 +141,6 @@ fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
 
-#[derive(Clone)]
 struct VhostUserNetBackend {
     mem: Option<GuestMemoryMmap>,
     vring_handler: Option<Arc<RwLock<VringEpollHandler<Self>>>>,
@@ -151,6 +150,21 @@ struct VhostUserNetBackend {
     tx: TxVirtio,
     rx_tap_listening: bool,
     epoll_fd: RawFd,
+}
+
+impl std::clone::Clone for VhostUserNetBackend {
+    fn clone(&self) -> Self {
+        VhostUserNetBackend {
+            mem: self.mem.clone(),
+            vring_handler: self.vring_handler.clone(),
+            kill_evt: self.kill_evt.try_clone().unwrap(),
+            tap: self.tap.clone(),
+            rx: self.rx.clone(),
+            tx: self.tx.clone(),
+            rx_tap_listening: self.rx_tap_listening,
+            epoll_fd: self.epoll_fd,
+        }
+    }
 }
 
 impl VhostUserNetBackend {

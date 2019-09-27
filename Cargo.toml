@@ -16,6 +16,7 @@ vhost_user_backend = { path = "vhost_user_backend"}
 virtio-bindings = { git = "https://github.com/rust-vmm/virtio-bindings", version = "0.1", features = ["virtio-v5_0_0"]}
 vmm = { path = "vmm" }
 vm-memory = { git = "https://github.com/rust-vmm/vm-memory" }
+vmm-sys-util = { git = "https://github.com/rust-vmm/vmm-sys-util" }
 vm-virtio = { path = "vm-virtio" }
 
 [dev-dependencies]
@@ -28,10 +29,6 @@ lazy_static= "1.4.0"
 [dependencies.vhost_rs]
 path = "vhost_rs"
 features = ["vhost-user-slave"]
-
-[dependencies.vmm-sys-util]
-git = "https://github.com/bjzhjing/vmm-sys-util"
-branch = "add_clone_eventfd"
 
 [features]
 default = ["acpi", "pci"]
