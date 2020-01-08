@@ -14,9 +14,12 @@ use acpi_tables::{aml, aml::Aml, sdt::SDT};
 use arc_swap::ArcSwap;
 use arch::layout;
 use devices::{ioapic, BusDevice};
-use kvm_bindings::CpuId;
+use kvm_bindings::{
+    kvm_fpu, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, CpuId,
+};
 use kvm_ioctls::*;
 use libc::{c_void, siginfo_t};
+use serde_derive::{Deserialize, Serialize};
 use std::cmp;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +30,16 @@ use vm_device::{Migratable, MigratableError, Pausable, Snapshotable};
 use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::{register_signal_handler, SIGRTMIN};
+
+#[derive(Copy, Clone, Default, Serialize, Deserialize)]
+pub struct KvmVcpuState {
+    vcpu_events: kvm_vcpu_events,
+    mp_state: kvm_mp_state,
+    regs: kvm_regs,
+    fpu: kvm_fpu,
+    sregs: kvm_sregs,
+    lapic_state: kvm_lapic_state,
+}
 
 // Debug I/O port
 #[cfg(target_arch = "x86_64")]
@@ -749,6 +762,47 @@ impl CpuManager {
         });
 
         madt
+    }
+
+    pub fn get_kvm_vcpu_serialize_state(&self) -> String {
+        let vcpu_count = self.vcpu_fds.len();
+        let mut kvm_vcpu_state_v: Vec<KvmVcpuState> = Vec::with_capacity(vcpu_count);
+
+        for i in 0..vcpu_count {
+            let vcpu_events = self.vcpu_fds[i].get_vcpu_events().unwrap();
+            let mp_state = self.vcpu_fds[i].get_mp_state().unwrap();
+            let regs = self.vcpu_fds[i].get_regs().unwrap();
+            let fpu = self.vcpu_fds[i].get_fpu().unwrap();
+            let sregs = self.vcpu_fds[i].get_sregs().unwrap();
+            let lapic_state = self.vcpu_fds[i].get_lapic().unwrap();
+            let vcpu_state = KvmVcpuState {
+                vcpu_events,
+                mp_state,
+                regs,
+                fpu,
+                sregs,
+                lapic_state,
+            };
+            kvm_vcpu_state_v.push(vcpu_state);
+        }
+        serde_json::to_string(&kvm_vcpu_state_v).unwrap()
+    }
+
+    pub fn set_kvm_vcpu_deserialize_state(&self, kvm_vcpu_ser: String) {
+        let vcpu_state_v: Vec<KvmVcpuState> = serde_json::from_str(&kvm_vcpu_ser).unwrap();
+
+        let vcpu_count = self.vcpu_fds.len();
+
+        for (i, vcpu_state) in vcpu_state_v.iter().enumerate().take(vcpu_count) {
+            self.vcpu_fds[i]
+                .set_vcpu_events(&vcpu_state.vcpu_events)
+                .unwrap();
+            self.vcpu_fds[i].set_mp_state(vcpu_state.mp_state).unwrap();
+            self.vcpu_fds[i].set_regs(&vcpu_state.regs).unwrap();
+            self.vcpu_fds[i].set_fpu(&vcpu_state.fpu).unwrap();
+            self.vcpu_fds[i].set_sregs(&vcpu_state.sregs).unwrap();
+            self.vcpu_fds[i].set_lapic(&vcpu_state.lapic_state).unwrap();
+        }
     }
 }
 
