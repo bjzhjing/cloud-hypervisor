@@ -214,6 +214,7 @@ pub struct Vm {
     state: RwLock<VmState>,
     cpu_manager: Arc<Mutex<cpu::CpuManager>>,
     memory_manager: Arc<Mutex<MemoryManager>>,
+    vm_fd: Arc<VmFd>,
 }
 
 impl Vm {
@@ -241,6 +242,7 @@ impl Vm {
             .map_err(Error::KernelFile)?;
         let fd = kvm.create_vm().map_err(Error::VmCreate)?;
         let fd = Arc::new(fd);
+        let vm_fd = fd.clone();
 
         // Set TSS
         fd.set_tss_address(arch::x86_64::layout::KVM_TSS_ADDRESS.raw_value() as usize)
@@ -355,6 +357,7 @@ impl Vm {
             state: RwLock::new(VmState::Created),
             cpu_manager,
             memory_manager,
+            vm_fd,
         })
     }
 
