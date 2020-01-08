@@ -15,11 +15,15 @@ vhost-user-slave = []
 [dependencies]
 bitflags = "1.1.0"
 libc = "0.2.60"
-vmm-sys-util = ">=0.3.1"
 
 [dependencies.vm-memory]
 git = "https://github.com/rust-vmm/vm-memory"
 optional = true
+
+[dependencies.vmm-sys-util]
+git = "https://github.com/aghecenco/vmm-sys-util"
+branch = "serde"
+features = ["with-serde"]
 
 [dev-dependencies]
 tempfile = "3.1.0"

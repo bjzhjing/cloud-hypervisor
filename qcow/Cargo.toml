@@ -13,7 +13,11 @@ byteorder = "1.3.2"
 libc = "0.2.60"
 log = "0.4.8"
 remain = "0.2.0"
-vmm-sys-util = ">=0.3.1"
+
+[dependencies.vmm-sys-util]
+git = "https://github.com/aghecenco/vmm-sys-util"
+branch = "serde"
+features = ["with-serde"]
 
 [dev-dependencies]
 tempfile = "3.1.0"

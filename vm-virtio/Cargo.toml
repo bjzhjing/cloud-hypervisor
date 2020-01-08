@@ -23,7 +23,6 @@ tempfile = "3.1.0"
 virtio-bindings = { git = "https://github.com/rust-vmm/virtio-bindings", version = "0.1", features = ["virtio-v5_0_0"]}
 vm-allocator = { path = "../vm-allocator" }
 vm-device = { path = "../vm-device" }
-vmm-sys-util = ">=0.3.1"
 
 [dependencies.vhost_rs]
 path = "../vhost_rs"
@@ -32,3 +31,8 @@ features = ["vhost-user-master"]
 [dependencies.vm-memory]
 git = "https://github.com/rust-vmm/vm-memory"
 features = ["backend-mmap"]
+
+[dependencies.vmm-sys-util]
+git = "https://github.com/aghecenco/vmm-sys-util"
+branch = "serde"
+features = ["with-serde"]

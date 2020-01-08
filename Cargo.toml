@@ -21,7 +21,6 @@ virtio-bindings = "0.1.0"
 vmm = { path = "vmm" }
 vm-device = { path = "vm-device" }
 vm-memory = { git = "https://github.com/rust-vmm/vm-memory" }
-vmm-sys-util = ">=0.3.1"
 vm-virtio = { path = "vm-virtio" }
 
 [dev-dependencies]
@@ -35,6 +34,11 @@ serde_json = ">=1.0.9"
 [dependencies.vhost_rs]
 path = "vhost_rs"
 features = ["vhost-user-slave"]
+
+[dependencies.vmm-sys-util]
+git = "https://github.com/aghecenco/vmm-sys-util"
+branch = "serde"
+features = ["with-serde"]
 
 [features]
 default = ["acpi", "pci", "cmos"]

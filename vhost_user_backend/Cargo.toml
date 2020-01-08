@@ -14,9 +14,13 @@ epoll = ">=4.0.1"
 libc = "0.2.66"
 vm-memory = { git = "https://github.com/rust-vmm/vm-memory" }
 vm-virtio = { path = "../vm-virtio" }
-vmm-sys-util = ">=0.3.1"
 
 [dependencies.vhost_rs]
 path = "../vhost_rs"
 features = ["vhost-user-slave"]
+
+[dependencies.vmm-sys-util]
+git = "https://github.com/aghecenco/vmm-sys-util"
+branch = "serde"
+features = ["with-serde"]
 

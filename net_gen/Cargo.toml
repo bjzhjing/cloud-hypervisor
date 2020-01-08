@@ -3,5 +3,8 @@ name = "net_gen"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
 
-[dependencies]
-vmm-sys-util = ">=0.3.1"
+[dependencies.vmm-sys-util]
+git = "https://github.com/aghecenco/vmm-sys-util"
+branch = "serde"
+features = ["with-serde"]
+
