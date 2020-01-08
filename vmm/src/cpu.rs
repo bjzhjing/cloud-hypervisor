@@ -12,10 +12,11 @@ use crate::device_manager::DeviceManager;
 #[cfg(feature = "acpi")]
 use acpi_tables::{aml, aml::Aml, sdt::SDT};
 use arc_swap::ArcSwap;
-use arch::layout;
+use arch::{layout, regs};
 use devices::{ioapic, BusDevice};
 use kvm_bindings::{
-    kvm_fpu, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, CpuId,
+    kvm_fpu, kvm_lapic_state, kvm_mp_state, kvm_msrs, kvm_regs, kvm_sregs, kvm_vcpu_events, CpuId,
+    Msrs,
 };
 use kvm_ioctls::*;
 use libc::{c_void, siginfo_t};
@@ -802,6 +803,33 @@ impl CpuManager {
             self.vcpu_fds[i].set_fpu(&vcpu_state.fpu).unwrap();
             self.vcpu_fds[i].set_sregs(&vcpu_state.sregs).unwrap();
             self.vcpu_fds[i].set_lapic(&vcpu_state.lapic_state).unwrap();
+        }
+    }
+
+    pub fn get_kvm_msrs_serialized(&self) -> String {
+        let vcpu_count = self.vcpu_fds.len();
+        let mut kvm_msrs_v: Vec<kvm_msrs> = Vec::with_capacity(vcpu_count);
+
+        for i in 0..vcpu_count {
+            let mut msrs_fam = regs::create_msr_entries();
+            self.vcpu_fds[i].get_msrs(&mut msrs_fam).unwrap();
+            let msrs = msrs_fam.into_raw();
+            kvm_msrs_v.push(msrs[0].clone());
+        }
+
+        let msrs_wrapper = unsafe { Msrs::from_raw(kvm_msrs_v) };
+        serde_json::to_string(&msrs_wrapper).unwrap()
+    }
+
+    pub fn set_kvm_msrs_deserialized(&self, kvm_msrs_s: String) {
+        let msrs_wrapper = serde_json::from_str::<Msrs>(kvm_msrs_s.as_str()).unwrap();
+        let kvm_msrs_v: Vec<kvm_msrs> = msrs_wrapper.into_raw();
+
+        for (i, _) in kvm_msrs_v.iter().enumerate() {
+            let mut msrs_v: Vec<kvm_msrs> = Vec::with_capacity(1);
+            msrs_v.push(kvm_msrs_v[i].clone());
+            let msrs_fam = unsafe { Msrs::from_raw(msrs_v) };
+            self.vcpu_fds[i].set_msrs(&msrs_fam).unwrap();
         }
     }
 }
