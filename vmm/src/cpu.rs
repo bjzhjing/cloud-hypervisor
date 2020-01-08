@@ -382,6 +382,7 @@ pub struct CpuManager {
     reset_evt: EventFd,
     vcpu_states: Vec<VcpuState>,
     selected_cpu: u8,
+    vcpu_fds: Vec<VcpuFd>,
 }
 
 const CPU_ENABLE_FLAG: usize = 0;
@@ -516,6 +517,7 @@ impl CpuManager {
             vcpu_states,
             reset_evt,
             selected_cpu: 0,
+            vcpu_fds: Vec::with_capacity(boot_vcpus as usize),
         }));
 
         device_manager
@@ -566,6 +568,9 @@ impl CpuManager {
                 ioapic,
                 creation_ts,
             )?;
+
+            vcpu.configure(entry_addr, &self.vm_memory, self.cpuid.clone())?;
+            self.vcpu_fds.push(vcpu.fd.clone());
 
             let vcpu_thread_barrier = vcpu_thread_barrier.clone();
 
