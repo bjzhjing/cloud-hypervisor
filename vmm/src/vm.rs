@@ -36,6 +36,7 @@ use kvm_bindings::{kvm_enable_cap, kvm_userspace_memory_region, KVM_CAP_SPLIT_IR
 use kvm_ioctls::*;
 use linux_loader::cmdline::Cmdline;
 use linux_loader::loader::KernelLoader;
+use serde_derive::{Deserialize, Serialize};
 use signal_hook::{iterator::Signals, SIGINT, SIGTERM, SIGWINCH};
 use std::ffi::CString;
 use std::fs::File;
@@ -595,6 +596,16 @@ impl Vm {
             .try_read()
             .map_err(|_| Error::PoisonedState)
             .map(|state| *state)
+    }
+
+    pub fn get_kvm_clock_data_serialized(&self) -> String {
+        let clock_data = self.vm_fd.get_clock().unwrap();
+        serde_json::to_string(&clock_data).unwrap()
+    }
+
+    pub fn set_kvm_clock_data_deserialized(&self, kvm_clock_data: String) {
+        let clock_data = serde_json::from_str(&kvm_clock_data).unwrap();
+        self.vm_fd.set_clock(&clock_data).unwrap();
     }
 }
 
